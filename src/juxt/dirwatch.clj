@@ -29,24 +29,28 @@
           (.setName (str "dirwatch-pool-" (swap! pool-counter inc)))
           (.setDaemon true))))))
 
+(defn- update-path-map [key-path-map path watch-key]
+  (swap! key-path-map assoc watch-key (.toString (.toAbsolutePath path))))
+
 (defn ^:private register-path
   "Register a watch service with a filesystem path.
-
   When collect-children? is set, returns a list of artificial events for files seen during recursion"
-  [^WatchService ws, ^Path path & [event-atom]]
-  (.register path ws
-             (into-array
-              (type StandardWatchEventKinds/ENTRY_CREATE)
-              [StandardWatchEventKinds/ENTRY_CREATE
-               StandardWatchEventKinds/ENTRY_DELETE
-               StandardWatchEventKinds/ENTRY_MODIFY]))
+  [^WatchService ws, ^Path path, key-path-map & [event-atom]]
+  (update-path-map
+    key-path-map path
+    (.register path ws
+               (into-array
+                (type StandardWatchEventKinds/ENTRY_CREATE)
+                [StandardWatchEventKinds/ENTRY_CREATE
+                  StandardWatchEventKinds/ENTRY_DELETE
+                  StandardWatchEventKinds/ENTRY_MODIFY])))
   (doseq [dir (.. path toAbsolutePath toFile listFiles)]
     (when (. dir isDirectory)
           (register-path ws (. dir toPath) event-atom))
     (when event-atom
           (swap! event-atom conj {:file dir, :count 1, :action :create}))))
 
-(defn ^:private wait-for-events [ws f]
+(defn ^:private wait-for-events [ws f key-path-map]
   (when ws ;; nil when this watcher is closed
 
     (let [k (.poll ws (long 5) TimeUnit/SECONDS #_(comment "We set a
@@ -55,7 +59,7 @@
       (when (and k (.isValid k))
         (doseq [ev (.pollEvents k) :when (not= (.kind ev)
                                                StandardWatchEventKinds/OVERFLOW)]
-          (let [file (.toFile (.resolve (.watchable k) (.context ev)))]
+          (let [file (File. (get @key-path-map k) (.toString (.context ev)))]
             (f {:file file
                 :count (.count ev)
                 :action (get {StandardWatchEventKinds/ENTRY_CREATE :create
@@ -65,14 +69,14 @@
             (when (and (= (.kind ev) StandardWatchEventKinds/ENTRY_CREATE)
                        (.isDirectory file))
               (let [artificial-events (atom (list))]
-                (register-path ws (.toPath file) artificial-events)
+                (register-path ws (.toPath file) key-path-map artificial-events)
                 (doseq [event @artificial-events]
                   (f event))))))
         ;; Cancel a key if the reset fails, this may indicate the path no longer exists
         (when-not (. k reset) (. k cancel)))
 
       ;; Repeat ad-infinitum
-      (send-via pool *agent* wait-for-events f)
+      (send-via pool *agent* wait-for-events f key-path-map)
 
       ;; Retain the watch service as the agent state.
       ws)))
@@ -97,13 +101,16 @@
   should be closed with close-watcher."
   [f & files]
   (let [ws (.newWatchService (FileSystems/getDefault))
-        f (continue-on-exception f)]
-    (doseq [file files :when (.exists file)] (register-path ws (. file toPath)))
+        f (continue-on-exception f)
+        key-path-map (atom {})]
+    (doseq [file files :when (.exists file)]
+      (register-path ws (. file toPath) key-path-map))
     (send-via pool (agent ws
                           :meta {::watcher true}
                           :error-handler (fn [ag ex]
                                            (.printStackTrace ex)
-                                           (send-via pool ag wait-for-events f)))
+                                           (send-via pool ag wait-for-events
+                                                     f key-path-map)))
               wait-for-events f)))
 
 (defn close-watcher
