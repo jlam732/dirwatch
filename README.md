@@ -1,5 +1,7 @@
 # dirwatch
 
+Forked from [dirwatch](https://github.com/juxt/dirwatch)
+
 Watch directories for changes.
 
 Similar to watchtower (but uses JDK 7 async notification mechanisms rather than polling)
